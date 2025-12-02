@@ -1,0 +1,402 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { Table, Button, Modal, Input, Select } from "@/components/UI";
+import { getPagamentos, createPagamento, updatePagamento, deletePagamento, getObras, getColaboradores } from "@/lib/api";
+import { Plus, Edit2, Trash2, Download } from "lucide-react";
+import toast from "react-hot-toast";
+
+export default function PagamentosPage() {
+  const [pagamentos, setPagamentos] = useState<any[]>([]);
+  const [obras, setObras] = useState<any[]>([]);
+  const [colaboradores, setColaboradores] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [lastPdf, setLastPdf] = useState<null | { url?: string; dataUrl?: string; fileName?: string }>(null);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [formData, setFormData] = useState<any>({
+    obra_id: "",
+    colaborador_id: "",
+    valor: "",
+    data_pagamento: "",
+    metodo: "pix",
+    status: "pendente",
+  });
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+  const [isCortesOpen, setIsCortesOpen] = useState(false);
+  const [cortesResult, setCortesResult] = useState<any>(null);
+
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  async function loadData() {
+    try {
+      const [pagData, obrasData, colaboradoresData] = await Promise.all([
+        getPagamentos(),
+        getObras(),
+        getColaboradores(),
+      ]);
+      setPagamentos(pagData || []);
+      setObras(obrasData || []);
+      setColaboradores(colaboradoresData || []);
+    } catch (error) {
+      toast.error("Erro ao carregar dados");
+      console.error(error);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleSubmit() {
+    try {
+      if (!formData.obra_id || !formData.colaborador_id || !formData.valor || !formData.data_pagamento) {
+        toast.error("Preencha todos os campos obrigatórios");
+        return;
+      }
+
+      const payload = {
+        ...formData,
+        valor: parseFloat(formData.valor),
+      };
+
+      if (editingId) {
+        await updatePagamento(editingId, payload);
+        toast.success("Pagamento atualizado");
+      } else {
+        await createPagamento(payload);
+        toast.success("Pagamento registrado");
+      }
+
+      setFormData({ obra_id: "", colaborador_id: "", valor: "", data_pagamento: "", metodo: "pix", status: "pendente" });
+      setEditingId(null);
+      setIsModalOpen(false);
+      loadData();
+    } catch (error) {
+      console.error("Erro ao salvar pagamento:", error);
+      const msg = (error as any)?.message || JSON.stringify(error) || "Erro ao salvar pagamento";
+      toast.error(msg);
+    }
+  }
+
+  async function handleDelete(id: string) {
+    if (!confirm("Tem certeza?")) return;
+    try {
+      await deletePagamento(id);
+      toast.success("Pagamento deletado");
+      loadData();
+    } catch (error) {
+      toast.error("Erro ao deletar");
+    }
+  }
+
+  async function handleGerarPDF() {
+    try {
+      const colaboradoresEmFoco = pagamentos.filter(p => p.obra_id === formData.obra_id);
+
+      const response = await fetch("/api/gerar-pdf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          colaboradores: colaboradoresEmFoco,
+          totalGeral: colaboradoresEmFoco.reduce((sum, p) => sum + (Number(p.valor) || 0), 0),
+          periodo: new Date().toLocaleDateString("pt-BR"),
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.url) {
+        setLastPdf({ url: data.url, fileName: data.fileName });
+        window.open(data.url, "_blank");
+        toast.success("PDF gerado com sucesso!");
+      } else if (data.dataUrl) {
+        setLastPdf({ dataUrl: data.dataUrl, fileName: data.fileName });
+        const newWindow = window.open();
+        if (newWindow) {
+          newWindow.document.write(`<iframe src="${data.dataUrl}" frameborder="0" style="border:0; width:100%; height:100%;"></iframe>`);
+          newWindow.document.title = data.fileName || "Pagamento.pdf";
+          toast.success("PDF gerado localmente (fallback)");
+        } else {
+          const a = document.createElement("a");
+          a.href = data.dataUrl;
+          a.download = data.fileName || "pagamento.pdf";
+          a.click();
+          toast.success("PDF pronto para download");
+        }
+      } else {
+        toast.error("Resposta inesperada ao gerar PDF");
+        console.error("Resposta inválida gerar-pdf:", data);
+      }
+    } catch (error) {
+      toast.error("Erro ao gerar PDF");
+    }
+  }
+
+  async function handleCalcularCortes() {
+    try {
+      setLoading(true);
+      const res = await fetch('/api/pagamentos/cortes');
+      const json = await res.json();
+      if (!res.ok) {
+        toast.error(json?.error || 'Erro ao calcular cortes');
+        return;
+      }
+      setCortesResult(json.resultado);
+      setIsCortesOpen(true);
+    } catch (err) {
+      console.error('Erro ao calcular cortes:', err);
+      toast.error('Erro ao calcular cortes');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createFromCorte(c: any) {
+    try {
+      const periodoParts = (c.periodo || '').split(' a ');
+      const periodoInicio = periodoParts[0];
+      const periodoFim = periodoParts[1] || new Date().toISOString().split('T')[0];
+
+      const checkRes = await fetch('/api/pagamentos/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ colaborador_id: c.id, periodo_inicio: periodoInicio, periodo_fim: periodoFim })
+      });
+      const checkJson = await checkRes.json();
+      if (checkJson.exists) {
+        const ok = confirm('Já existe pagamento para este colaborador no período. Deseja criar outro?');
+        if (!ok) return;
+      }
+
+      const dataFim = periodoFim;
+      const payload = {
+        obra_id: '',
+        colaborador_id: c.id || null,
+        valor: c.valor || 0,
+        data_pagamento: dataFim,
+        metodo: 'pix',
+        status: 'pendente',
+      };
+
+      await createPagamento(payload);
+      toast.success('Pagamento criado para ' + c.nome);
+      loadData();
+    } catch (err) {
+      console.error('Erro criando pagamento:', err);
+      toast.error('Erro ao criar pagamento');
+    }
+  }
+
+  async function createAllFromCortes() {
+    try {
+      let created = 0;
+      let skipped = 0;
+      for (const c of (cortesResult?.colaboradores || [])) {
+        const periodoParts = (c.periodo || '').split(' a ');
+        const periodoInicio = periodoParts[0];
+        const periodoFim = periodoParts[1] || new Date().toISOString().split('T')[0];
+
+        const checkRes = await fetch('/api/pagamentos/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ colaborador_id: c.id, periodo_inicio: periodoInicio, periodo_fim: periodoFim })
+        });
+        const checkJson = await checkRes.json();
+        if (checkJson.exists) {
+          skipped++;
+          continue;
+        }
+
+        const dataFim = periodoFim;
+        const payload = {
+          obra_id: '',
+          colaborador_id: c.id || null,
+          valor: c.valor || 0,
+          data_pagamento: dataFim,
+          metodo: 'pix',
+          status: 'pendente',
+        };
+        await createPagamento(payload);
+        created++;
+      }
+      toast.success(`Pagamentos criados: ${created}. Pulados por duplicidade: ${skipped}`);
+      setIsCortesOpen(false);
+      loadData();
+    } catch (err) {
+      console.error('Erro criando pagamentos em lote:', err);
+      toast.error('Erro ao criar alguns pagamentos');
+    }
+  }
+
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-3xl font-bold">Pagamentos</h1>
+        <div className="flex gap-2">
+          <Button onClick={handleGerarPDF} variant="secondary">
+            <Download size={20} className="mr-2" /> Gerar PDF
+          </Button>
+          <Button onClick={handleCalcularCortes} variant="secondary">
+            <Download size={20} className="mr-2" /> Calcular Cortes
+          </Button>
+          {lastPdf && (
+            <Button onClick={handleOpenLastPdf} variant="secondary">
+              <Download size={20} className="mr-2" /> Abrir/Download PDF
+            </Button>
+          )}
+          <Button
+            onClick={() => {
+              setEditingId(null);
+              setFormData({ obra_id: "", colaborador_id: "", valor: "", data_pagamento: "", metodo: "pix", status: "pendente" });
+              setIsModalOpen(true);
+            }}
+            variant="primary"
+          >
+            <Plus size={20} className="mr-2" /> Novo Pagamento
+          </Button>
+        </div>
+      </div>
+
+      <Table
+        columns={[
+          { key: "data_pagamento", label: "Data" },
+          { key: "obra_id", label: "Obra" },
+          { key: "colaborador_id", label: "Colaborador" },
+          { key: "valor", label: "Valor" },
+          { key: "metodo", label: "Método" },
+          { key: "status", label: "Status" },
+        ]}
+        data={pagamentos.map(p => ({
+          ...p,
+          valor: `R$ ${parseFloat(p.valor || 0).toFixed(2)}`,
+        }))}
+        loading={loading}
+        actions={(row) => (
+          <div className="flex gap-2">
+            <button
+              onClick={() => {
+                const pagamento = row as any;
+                setEditingId(pagamento.id);
+                setFormData(pagamento as any);
+                setIsModalOpen(true);
+              }}
+              className="text-blue-600 hover:text-blue-900"
+            >
+              <Edit2 size={18} />
+            </button>
+            <button
+              onClick={() => handleDelete(row.id)}
+              className="text-red-600 hover:text-red-900"
+            >
+              <Trash2 size={18} />
+            </button>
+          </div>
+        )}
+      />
+
+      <Modal
+        isOpen={isModalOpen}
+        title={editingId ? "Editar Pagamento" : "Novo Pagamento"}
+        onClose={() => setIsModalOpen(false)}
+      >
+        <Select
+          label="Obra"
+          value={formData.obra_id}
+          onChange={(e) => setFormData({ ...formData, obra_id: e.target.value })}
+          options={obras.map(o => ({ value: o.id, label: o.nome }))}
+        />
+        <Select
+          label="Colaborador"
+          value={formData.colaborador_id}
+          onChange={(e) => setFormData({ ...formData, colaborador_id: e.target.value })}
+          options={colaboradores.map(c => ({ value: c.id, label: c.nome }))}
+        />
+        <Input
+          label="Valor"
+          type="number"
+          step="0.01"
+          value={formData.valor}
+          onChange={(e) => setFormData({ ...formData, valor: e.target.value })}
+          placeholder="0.00"
+        />
+        <Input
+          label="Data do Pagamento"
+          type="date"
+          value={formData.data_pagamento}
+          onChange={(e) => setFormData({ ...formData, data_pagamento: e.target.value })}
+        />
+        <Select
+          label="Método"
+          value={formData.metodo}
+          onChange={(e) => setFormData({ ...formData, metodo: e.target.value })}
+          options=[
+            { value: "pix", label: "PIX" },
+            { value: "dinheiro", label: "Dinheiro" },
+            { value: "deposito", label: "Depósito" },
+            { value: "transferencia", label: "Transferência" },
+          ]
+        />
+        <Select
+          label="Status"
+          value={formData.status}
+          onChange={(e) => setFormData({ ...formData, status: e.target.value })}
+          options=[
+            { value: "pendente", label: "Pendente" },
+            { value: "pago", label: "Pago" },
+            { value: "cancelado", label: "Cancelado" },
+          ]
+        />
+        <div className="flex gap-2 mt-6">
+          <Button variant="primary" onClick={handleSubmit} className="flex-1">
+            Salvar
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => setIsModalOpen(false)}
+            className="flex-1"
+          >
+            Cancelar
+          </Button>
+        </div>
+      </Modal>
+
+      <Modal
+        isOpen={isCortesOpen}
+        title="Resultado dos Cortes"
+        onClose={() => setIsCortesOpen(false)}
+      >
+        {!cortesResult && <div>Carregando...</div>}
+        {cortesResult && (
+          <div>
+            <div className="mb-4">Total geral: R$ { (cortesResult.totalGeral || 0).toFixed(2) }</div>
+            <div className="space-y-2 max-h-80 overflow-auto">
+              {(cortesResult.colaboradores || []).map((c, idx) => (
+                <div key={idx} className="flex justify-between items-center p-2 border rounded">
+                  <div>
+                    <div className="font-medium">{c.nome} ({c.tipo})</div>
+                    <div className="text-sm">{c.periodo || ''}</div>
+                    {c.horasTotal !== undefined && (
+                      <div className="text-sm">Horas: {c.horasTotal}</div>
+                    )}
+                    {c.quantidade !== undefined && (
+                      <div className="text-sm">Qtd: {c.quantidade} • Unit: R$ {c.valor_unitario}</div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="font-semibold">R$ { (c.valor || 0).toFixed(2) }</div>
+                    <Button onClick={() => createFromCorte(c)} variant="primary">Criar</Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-4 flex gap-2">
+              <Button variant="primary" onClick={createAllFromCortes}>Criar Todos</Button>
+              <Button variant="secondary" onClick={() => setIsCortesOpen(false)}>Fechar</Button>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}
